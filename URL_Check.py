@@ -77,7 +77,7 @@ if uploaded_file:
                 file_name = st.text_input("📝 Enter file name for the result (without extension)", value="URL_Status_Result")
                 if not file_name.strip():
                     file_name = "URL_Status_Result"
-                file_name += ".xlsx"
+                    file_name += ".xlsx"
     
                 # Convert to downloadable file
                 output = BytesIO()
