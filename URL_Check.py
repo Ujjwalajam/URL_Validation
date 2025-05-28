@@ -71,7 +71,7 @@ if uploaded_file:
             with st.spinner("Checking URLs..."):
                 df['Status'] = process_urls_with_progress(df['URL'])
                 st.success("✅ URL Checking Completed!")
-                st.dataframe(df)
+                # st.dataframe(df)
 
                 # Convert to downloadable file
                 output = BytesIO()
