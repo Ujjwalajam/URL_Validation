@@ -1,21 +1,23 @@
 import pandas as pd
 import requests
-from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import base64
 import os
+import pickle
 
 st.set_page_config(page_title="URL Status Checker", layout="wide")
-st.title("🔗 URL Status Checker (Excel Based with Resume)")
+st.title("🔗 URL Status Checker with Resume Support")
+
+CHECKPOINT_FILE = "checkpoint.pkl"
+DEFAULT_THREADS = 20
+SAVE_INTERVAL = 20  # Save progress every 20 rows
 
 uploaded_file = st.file_uploader("📁 Upload Excel File (Must have a 'URL' column)", type=["xlsx"])
-max_workers = st.slider("🔧 Select number of threads", 1, 20, 5)
-checkpoint_interval = st.slider("💾 Checkpoint Save Interval", 1, 100, 25)
-custom_filename = st.text_input("📄 Save output file as (without extension)", value="URL_Status_Result")
+resume_enabled = st.checkbox("🔄 Enable Resume Progress if Interrupted", value=True)
+save_filename = st.text_input("💾 Enter name to save result file as", value="URL_Status_Result")
 
-CHECKPOINT_DIR = "checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 def check_url(url):
     try:
@@ -24,67 +26,79 @@ def check_url(url):
     except requests.exceptions.RequestException as e:
         return f"Invalid ({str(e)})"
 
-def save_checkpoint(df, filename):
-    df.to_excel(os.path.join(CHECKPOINT_DIR, f"checkpoint_{filename}.xlsx"), index=False)
 
-def load_checkpoint(filename):
-    path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{filename}.xlsx")
-    return pd.read_excel(path) if os.path.exists(path) else None
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+
+def save_checkpoint(index, status_list):
+    with open(CHECKPOINT_FILE, 'wb') as f:
+        pickle.dump((index, status_list), f)
+
+
+def delete_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
 
 if uploaded_file:
-    original_filename = uploaded_file.name.split(".")[0]
-    checkpoint_data = load_checkpoint(original_filename)
+    df = pd.read_excel(uploaded_file)
 
-    if checkpoint_data is not None:
-        resume = st.radio("⚠️ Incomplete session found. Do you want to resume?", ["Yes", "No"])
-        if resume == "Yes":
-            df = checkpoint_data
-        else:
-            df = pd.read_excel(uploaded_file)
-            df["Status"] = df.get("Status", pd.Series([None]*len(df)))
-    else:
-        df = pd.read_excel(uploaded_file)
-        df["Status"] = df.get("Status", pd.Series([None]*len(df)))
-
-    if "URL" not in df.columns:
+    if 'URL' not in df.columns:
         st.error("❌ Excel must contain a column named 'URL'")
     else:
         if st.button("🚀 Start Checking"):
-            progress_bar = st.progress(0)
-            status_placeholder = st.empty()
-            total = len(df)
-            
-            def get_unchecked_indices():
-                return df[df['Status'].isnull()].index.tolist()
+            if resume_enabled:
+                checkpoint = load_checkpoint()
+            else:
+                checkpoint = None
 
-            indices_to_check = get_unchecked_indices()
+            if checkpoint:
+                start_index, results = checkpoint
+                st.warning(f"⚠️ Resuming from row {start_index}...")
+            else:
+                start_index, results = 0, []
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for i, idx in enumerate(indices_to_check):
-                    url = df.at[idx, "URL"]
-                    future = executor.submit(check_url, url)
-                    df.at[idx, "Status"] = future.result()
+            with st.spinner("Checking URLs... This may take a while."):
+                urls_to_check = df['URL'].tolist()
+                total = len(urls_to_check)
+                progress_bar = st.progress(0)
 
-                    if (i + 1) % checkpoint_interval == 0 or i == len(indices_to_check) - 1:
-                        save_checkpoint(df, original_filename)
+                with ThreadPoolExecutor(max_workers=DEFAULT_THREADS) as executor:
+                    for i in range(start_index, total, DEFAULT_THREADS):
+                        end = min(i + DEFAULT_THREADS, total)
+                        chunk = urls_to_check[i:end]
+                        chunk_results = list(executor.map(check_url, chunk))
+                        results.extend(chunk_results)
 
-                    progress = int(((i + 1) / len(indices_to_check)) * 100)
-                    progress_bar.progress(progress)
-                    status_placeholder.info(f"Processed {i + 1} / {len(indices_to_check)} URLs")
+                        current_index = end
+                        if resume_enabled and (current_index % SAVE_INTERVAL == 0 or current_index == total):
+                            save_checkpoint(current_index, results)
 
-            st.success("✅ URL Checking Completed!")
-            st.dataframe(df)
+                        progress_bar.progress(min(current_index / total, 1.0))
 
-            # Save final output
-            output = BytesIO()
-            df.to_excel(output, index=False)
-            output.seek(0)
+                df = df.iloc[:len(results)]
+                df['Status'] = results
+                delete_checkpoint()
 
-            b64 = base64.b64encode(output.read()).decode()
-            download_filename = f"{custom_filename}.xlsx"
-            href = f'<a href="data:application/octet-stream;base64,{b64}" download="{download_filename}">📥 Download {download_filename}</a>'
-            st.markdown(href, unsafe_allow_html=True)
+                st.success("✅ URL Checking Completed!")
+                st.dataframe(df)
 
-            # Remove checkpoint
-            os.remove(os.path.join(CHECKPOINT_DIR, f"checkpoint_{original_filename}.xlsx"))
-            st.info("🗑️ Temporary checkpoint file removed after success.")
+                output = BytesIO()
+                df.to_excel(output, index=False)
+                output.seek(0)
+
+                b64 = base64.b64encode(output.read()).decode()
+                href = f'<a href="data:application/octet-stream;base64,{b64}" download="{save_filename}.xlsx">📥 Download Result</a>'
+                st.markdown(href, unsafe_allow_html=True)
+
+        with st.expander("📄 Need a sample file?"):
+            sample_df = pd.DataFrame({"URL": ["https://www.google.com", "https://www.invalidurl1234.com"]})
+            sample_output = BytesIO()
+            sample_df.to_excel(sample_output, index=False)
+            sample_output.seek(0)
+            b64_sample = base64.b64encode(sample_output.read()).decode()
+            href_sample = f'<a href="data:application/octet-stream;base64,{b64_sample}" download="Sample_URL_File.xlsx">📥 Download Sample File</a>'
+            st.markdown(href_sample, unsafe_allow_html=True)
