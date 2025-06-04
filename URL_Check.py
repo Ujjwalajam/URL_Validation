@@ -4,32 +4,19 @@ from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 from io import BytesIO
 import base64
-import time
+import os
 
 st.set_page_config(page_title="URL Status Checker", layout="wide")
-st.title("🔗 URL Status Checker (Excel Based)")
+st.title("🔗 URL Status Checker (Excel Based with Resume)")
 
-# 1. Sample file download
-st.subheader("📄 Sample Excel File")
-sample_df = pd.DataFrame({'URL': ['https://www.google.com', 'https://www.example.com']})
-sample_buffer = BytesIO()
-sample_df.to_excel(sample_buffer, index=False)
-sample_buffer.seek(0)
-st.download_button(
-    label="📥 Download Sample Excel",
-    data=sample_buffer,
-    file_name="Sample_URL_List.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-# 2. File uploader
-st.subheader("📁 Upload Your Excel File")
-uploaded_file = st.file_uploader("Upload Excel file with a column named 'URL'", type=["xlsx"])
-
-# 3. Slider for thread control
+uploaded_file = st.file_uploader("📁 Upload Excel File (Must have a 'URL' column)", type=["xlsx"])
 max_workers = st.slider("🔧 Select number of threads", 1, 20, 5)
+checkpoint_interval = st.slider("💾 Checkpoint Save Interval", 1, 100, 25)
+custom_filename = st.text_input("📄 Save output file as (without extension)", value="URL_Status_Result")
 
-# 4. URL checking function
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 def check_url(url):
     try:
         response = requests.get(url, timeout=5)
@@ -37,52 +24,67 @@ def check_url(url):
     except requests.exceptions.RequestException as e:
         return f"Invalid ({str(e)})"
 
-# 5. Threaded processing with progress
-def process_urls_with_progress(urls):
-    results = []
-    total = len(urls)
-    start = time.time()
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+def save_checkpoint(df, filename):
+    df.to_excel(os.path.join(CHECKPOINT_DIR, f"checkpoint_{filename}.xlsx"), index=False)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for i, result in enumerate(executor.map(check_url, urls)):
-            results.append(result)
-            elapsed = time.time() - start
-            estimated_total = (elapsed / (i + 1)) * total
-            remaining = estimated_total - elapsed
-            progress_bar.progress((i + 1) / total)
-            status_text.text(
-                f"⏳ Processing {i+1}/{total} | "
-                f"Elapsed: {round(elapsed, 1)}s | "
-                f"ETA: {round(remaining, 1)}s"
-            )
+def load_checkpoint(filename):
+    path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{filename}.xlsx")
+    return pd.read_excel(path) if os.path.exists(path) else None
 
-    return results
-
-# 6. Main logic
 if uploaded_file:
-    df = pd.read_excel(uploaded_file)
+    original_filename = uploaded_file.name.split(".")[0]
+    checkpoint_data = load_checkpoint(original_filename)
 
-    if 'URL' not in df.columns:
+    if checkpoint_data is not None:
+        resume = st.radio("⚠️ Incomplete session found. Do you want to resume?", ["Yes", "No"])
+        if resume == "Yes":
+            df = checkpoint_data
+        else:
+            df = pd.read_excel(uploaded_file)
+            df["Status"] = df.get("Status", pd.Series([None]*len(df)))
+    else:
+        df = pd.read_excel(uploaded_file)
+        df["Status"] = df.get("Status", pd.Series([None]*len(df)))
+
+    if "URL" not in df.columns:
         st.error("❌ Excel must contain a column named 'URL'")
     else:
-        if st.button("🚀 Start URL Checking"):
-            with st.spinner("Checking URLs..."):
-                df['Status'] = process_urls_with_progress(df['URL'])
-                st.success("✅ URL Checking Completed!")
-                st.dataframe(df)
+        if st.button("🚀 Start Checking"):
+            progress_bar = st.progress(0)
+            status_placeholder = st.empty()
+            total = len(df)
+            
+            def get_unchecked_indices():
+                return df[df['Status'].isnull()].index.tolist()
 
-                # Input for custom file name
-                file_name = st.text_input("📝 Enter file name for the result (without extension)", value="URL_Status_Result")
-                if not file_name.strip():
-                    file_name = "URL_Status_Result"
-                file_name += ".xlsx"
-    
-                # Convert to downloadable file
-                output = BytesIO()
-                df.to_excel(output, index=False)
-                output.seek(0)
-                b64 = base64.b64encode(output.read()).decode()
-                href = f'<a href="data:application/octet-stream;base64,{b64}" download="{file_name}">📥 Download Result</a>'
-                st.markdown(href, unsafe_allow_html=True)
+            indices_to_check = get_unchecked_indices()
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for i, idx in enumerate(indices_to_check):
+                    url = df.at[idx, "URL"]
+                    future = executor.submit(check_url, url)
+                    df.at[idx, "Status"] = future.result()
+
+                    if (i + 1) % checkpoint_interval == 0 or i == len(indices_to_check) - 1:
+                        save_checkpoint(df, original_filename)
+
+                    progress = int(((i + 1) / len(indices_to_check)) * 100)
+                    progress_bar.progress(progress)
+                    status_placeholder.info(f"Processed {i + 1} / {len(indices_to_check)} URLs")
+
+            st.success("✅ URL Checking Completed!")
+            st.dataframe(df)
+
+            # Save final output
+            output = BytesIO()
+            df.to_excel(output, index=False)
+            output.seek(0)
+
+            b64 = base64.b64encode(output.read()).decode()
+            download_filename = f"{custom_filename}.xlsx"
+            href = f'<a href="data:application/octet-stream;base64,{b64}" download="{download_filename}">📥 Download {download_filename}</a>'
+            st.markdown(href, unsafe_allow_html=True)
+
+            # Remove checkpoint
+            os.remove(os.path.join(CHECKPOINT_DIR, f"checkpoint_{original_filename}.xlsx"))
+            st.info("🗑️ Temporary checkpoint file removed after success.")
