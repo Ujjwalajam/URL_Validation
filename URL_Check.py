@@ -27,6 +27,8 @@ def process_urls_with_progress(df, status_column="Status"):
     batch_size = 10
     start_time = time.time()
 
+    progress_placeholder = st.empty()
+
     with ThreadPoolExecutor(max_workers=DEFAULT_THREADS) as executor:
         futures = {}
         for idx, row in df.iterrows():
@@ -41,12 +43,13 @@ def process_urls_with_progress(df, status_column="Status"):
 
                 futures.clear()
 
+                # Show progress (only one line)
                 elapsed = time.time() - start_time
                 avg_time = elapsed / completed if completed else 1
-                remaining_time = int((total - completed) * avg_time)
-
-                st.progress(completed / total)
-                st.info(f"✅ Checked: {completed}/{total} | ⏳ Est. time left: {remaining_time}s")
+                remaining_time = (total - completed) * avg_time / 60  # in minutes
+                progress_placeholder.info(
+                    f"✔️ Checked: {completed}/{total} | ⏳ Time left: {remaining_time:.1f} min"
+                )
 
                 # Save checkpoint
                 df.to_csv(CHECKPOINT_FILE, index=False)
@@ -56,7 +59,6 @@ def process_urls_with_progress(df, status_column="Status"):
             df.at[futures[future], status_column] = future.result()
             completed += 1
 
-        st.progress(1.0)
         st.success("🎉 URL Checking Completed!")
         df.to_csv(CHECKPOINT_FILE, index=False)
         return df
@@ -81,7 +83,6 @@ if uploaded_file:
     if 'URL' not in df.columns:
         st.error("❌ Uploaded file must contain a column named 'URL'")
     else:
-        # Initialize status column
         if 'Status' not in df.columns:
             df['Status'] = None
 
@@ -108,5 +109,5 @@ if uploaded_file:
             href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">📥 Download Final File</a>'
             st.markdown(href, unsafe_allow_html=True)
 
-            # Remove checkpoint file after successful run
+            # Cleanup checkpoint
             os.remove(CHECKPOINT_FILE)
